@@ -6,10 +6,12 @@ import configparser
 import getpass  
 import re  
 import sys  
+import logging  
 from datetime import datetime  
 import win32security  
 import win32con  
   
+# --- CONFIGURABLE CONSTANTS ---  
 INI_DEFAULTS = {  
     'OriginPath': '',  
     'TargetPath': '',  
@@ -17,10 +19,50 @@ INI_DEFAULTS = {
     'AutoTimestampDir': 'False',  
     'SanitizeDoubleExt': 'True',  
     'StripIllegalChars': 'True',  
-    'MetadataFields': 'All'  
+    'MetadataFields': 'All',  
+    'ChunkSizeMB': '16',           # For chunked copy  
+    'LargeFileThresholdMB': '100'  # Files larger than this use chunked copy  
 }  
   
-ILLEGAL_CHARS = r'[<>:"/\\|?*]'  
+LOG_FILE = 'file_transfer.log'  
+  
+# --- ILLEGAL CHARACTER HANDLING ---  
+ILLEGAL_CHARS_PATTERN = re.compile(r'[\x00-\x1F<>:"/\\|?*]|[^\x00-\x7F]')  
+  
+def sanitize_with_mask(original_str, replace_with='_'):  
+    """  
+    Replace illegal characters with `replace_with` and return (sanitized, mask).  
+    Mask is a string of '1' for replaced chars, '0' for untouched.  
+    """  
+    sanitized = []  
+    mask = []  
+    for c in original_str:  
+        if ILLEGAL_CHARS_PATTERN.match(c):  
+            sanitized.append(replace_with)  
+            mask.append('1')  
+        else:  
+            sanitized.append(c)  
+            mask.append('0')  
+    return ''.join(sanitized), ''.join(mask)  
+  
+def sanitize_filename(filename, strip_illegal=True, sanitize_ext=True):  
+    orig = filename  
+    mask = None  
+    if strip_illegal:  
+        filename, mask = sanitize_with_mask(filename, replace_with='_')  
+    if sanitize_ext:  
+        parts = filename.split('.')  
+        if len(parts) > 2:  
+            filename = parts[0] + '.' + parts[-1]  
+    return filename, orig != filename, mask  
+  
+# --- LOGGING SETUP ---  
+logging.basicConfig(  
+    filename=LOG_FILE,  
+    filemode='a',  
+    level=logging.INFO,  
+    format='%(asctime)s %(levelname)s %(message)s'  
+)  
   
 def prompt_for_ini(ini_path):  
     if not os.path.exists(ini_path):  
@@ -50,7 +92,6 @@ def prompt_for_credentials():
     return None, None  
   
 def impersonate_user(username, password):  
-    # Only if credentials provided  
     if not username or not password:  
         return None  
     try:  
@@ -63,18 +104,9 @@ def impersonate_user(username, password):
         win32security.ImpersonateLoggedOnUser(handle)  
         return handle  
     except Exception as e:  
+        logging.error(f"Impersonation failed for {username}: {e}")  
         print(f"Impersonation failed: {e}")  
         return None  
-  
-def sanitize_filename(filename, strip_illegal=True, sanitize_ext=True):  
-    orig = filename  
-    if strip_illegal:  
-        filename = re.sub(ILLEGAL_CHARS, '_', filename)  
-    if sanitize_ext:  
-        parts = filename.split('.')  
-        if len(parts) > 2:  
-            filename = parts[0] + '.' + parts[-1]  
-    return filename, orig != filename  
   
 def make_timestamped_dir(base_path):  
     now = datetime.now().strftime('%Y%m%d_%H%M%S')  
@@ -83,63 +115,123 @@ def make_timestamped_dir(base_path):
     return new_dir  
   
 def is_relative(path):  
+    # UNC paths are absolute  
+    if path.startswith('\\\\'):  
+        return False  
     return not os.path.isabs(path)  
+  
+def normalize_path(path):  
+    # Normalize slashes and remove redundant separators  
+    return os.path.normpath(path)  
   
 def make_hyperlink(path):  
     # For Excel, hyperlinks are like: =HYPERLINK("file:///C:/path/to/file")  
     return f'=HYPERLINK("file:///{path.replace("\\", "/")}")'  
   
+def chunked_copy(src, dst, chunk_size=16*1024*1024):  
+    """Copy file in chunks to handle large files."""  
+    try:  
+        with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:  
+            while True:  
+                buf = fsrc.read(chunk_size)  
+                if not buf:  
+                    break  
+                fdst.write(buf)  
+        shutil.copystat(src, dst)  # Copy file metadata  
+        return True, ""  
+    except Exception as e:  
+        return False, str(e)  
+  
 def process_transfer(row, idx, config, meta_fields, origin_base, target_base, options, meta_writer, lock):  
     origin_path = row[0]  
     target_path = row[1]  
     illegal_chars_stripped = False  
+    illegal_mask = ''  
   
-    # Handle relative paths  
-    if is_relative(origin_path):  
-        origin_path = os.path.join(origin_base, origin_path)  
-    if is_relative(target_path):  
-        target_path = os.path.join(target_base, target_path)  
-  
-    # Sanitize filename if needed  
-    filename = os.path.basename(target_path)  
-    sanitized, was_sanitized = sanitize_filename(  
-        filename,  
-        strip_illegal=options['strip_illegal'],  
-        sanitize_ext=options['sanitize_ext']  
-    )  
-    illegal_chars_stripped = was_sanitized  
-  
-    target_dir = os.path.dirname(target_path)  
-    if not os.path.exists(target_dir):  
-        os.makedirs(target_dir, exist_ok=True)  
-    target_path = os.path.join(target_dir, sanitized)  
-  
-    # Copy file  
-    status = 'Success'  
-    error = ''  
     try:  
-        shutil.copy2(origin_path, target_path)  
+        # Handle relative paths and normalize  
+        if is_relative(origin_path):  
+            origin_path = os.path.join(origin_base, origin_path)  
+        origin_path = normalize_path(origin_path)  
+  
+        if is_relative(target_path):  
+            target_path = os.path.join(target_base, target_path)  
+        target_path = normalize_path(target_path)  
+  
+        # Sanitize filename if needed  
+        filename = os.path.basename(target_path)  
+        sanitized, was_sanitized, illegal_mask = sanitize_filename(  
+            filename,  
+            strip_illegal=options['strip_illegal'],  
+            sanitize_ext=options['sanitize_ext']  
+        )  
+        illegal_chars_stripped = was_sanitized  
+  
+        target_dir = os.path.dirname(target_path)  
+        if not os.path.exists(target_dir):  
+            os.makedirs(target_dir, exist_ok=True)  
+        target_path = os.path.join(target_dir, sanitized)  
+  
+        # Check if origin exists and is file  
+        if not os.path.exists(origin_path):  
+            status = 'Failure'  
+            error = f"Origin file does not exist: {origin_path}"  
+            logging.error(error)  
+        elif not os.path.isfile(origin_path):  
+            status = 'Failure'  
+            error = f"Origin path is not a file: {origin_path}"  
+            logging.error(error)  
+        else:  
+            # Decide on chunked copy  
+            file_size = os.path.getsize(origin_path)  
+            chunk_size = options['chunk_size']  
+            threshold = options['large_file_threshold']  
+            if file_size >= threshold:  
+                # Chunked copy  
+                ok, err = chunked_copy(origin_path, target_path, chunk_size)  
+                if ok:  
+                    status = 'Success'  
+                    error = ''  
+                else:  
+                    status = 'Failure'  
+                    error = f"Chunked copy failed: {err}"  
+                    logging.error(f"Chunked copy failed for {origin_path} -> {target_path}: {err}")  
+            else:  
+                # Normal copy  
+                try:  
+                    shutil.copy2(origin_path, target_path)  
+                    status = 'Success'  
+                    error = ''  
+                except Exception as e:  
+                    status = 'Failure'  
+                    error = f"Copy failed: {e}"  
+                    logging.error(f"Copy failed for {origin_path} -> {target_path}: {e}")  
+  
     except Exception as e:  
         status = 'Failure'  
-        error = str(e)  
+        error = f"Unexpected error: {e}"  
+        logging.error(f"Unexpected error for row {idx}: {e}")  
   
     # Prepare metadata row  
-    meta_row = []  
-    if meta_fields == 'All':  
-        meta_row = row  
-    else:  
-        meta_row = [row[int(i)-1] for i in meta_fields.split(',') if i.isdigit() and int(i)-1 < len(row)]  
+    try:  
+        meta_row = []  
+        if meta_fields == 'All':  
+            meta_row = row  
+        else:  
+            meta_row = [row[int(i)-1] for i in meta_fields.split(',') if i.isdigit() and int(i)-1 < len(row)]  
   
-    meta_row += [  
-        make_hyperlink(origin_path),  
-        make_hyperlink(target_path),  
-        f"{status}: {error}" if error else status,  
-        str(illegal_chars_stripped)  
-    ]  
+        meta_row += [  
+            make_hyperlink(origin_path),  
+            make_hyperlink(target_path),  
+            f"{status}: {error}" if error else status,  
+            illegal_mask if illegal_mask else ''  
+        ]  
   
-    # Write metadata (thread-safe)  
-    with lock:  
-        meta_writer.writerow(meta_row)  
+        # Write metadata (thread-safe)  
+        with lock:  
+            meta_writer.writerow(meta_row)  
+    except Exception as e:  
+        logging.error(f"Metadata write failed for row {idx}: {e}")  
   
 def main():  
     ini_path = 'config.ini'  
@@ -150,6 +242,7 @@ def main():
     csv_path = input("Enter FileTransfers CSV path: ").strip()  
     if not os.path.exists(csv_path):  
         print(f"CSV file '{csv_path}' not found.")  
+        logging.error(f"CSV file '{csv_path}' not found.")  
         sys.exit(1)  
   
     # Origin/target base paths  
@@ -170,13 +263,25 @@ def main():
             print("Proceeding with current user credentials.")  
   
     # Threading  
-    threads_count = int(config.get('Threads', '4'))  
+    try:  
+        threads_count = int(config.get('Threads', '4'))  
+    except Exception:  
+        threads_count = 4  
   
     # Options  
+    try:  
+        chunk_size = int(config.get('ChunkSizeMB', '16')) * 1024 * 1024  
+        large_file_threshold = int(config.get('LargeFileThresholdMB', '100')) * 1024 * 1024  
+    except Exception:  
+        chunk_size = 16 * 1024 * 1024  
+        large_file_threshold = 100 * 1024 * 1024  
+  
     options = {  
         'timestamp_dir': config.get('AutoTimestampDir', 'False').lower() == 'true',  
         'sanitize_ext': config.get('SanitizeDoubleExt', 'True').lower() == 'true',  
-        'strip_illegal': config.get('StripIllegalChars', 'True').lower() == 'true'  
+        'strip_illegal': config.get('StripIllegalChars', 'True').lower() == 'true',  
+        'chunk_size': chunk_size,  
+        'large_file_threshold': large_file_threshold  
     }  
   
     # Metadata fields  
@@ -201,7 +306,7 @@ def main():
             meta_header = header  
         else:  
             meta_header = [header[int(i)-1] for i in meta_fields.split(',') if i.isdigit() and int(i)-1 < len(header)]  
-        meta_header += ['Origin Hyperlink', 'Target Hyperlink', 'Transfer Status', 'Illegal_Chars_Stripped']  
+        meta_header += ['Origin Hyperlink', 'Target Hyperlink', 'Transfer Status', 'Illegal_Char_Mask']  
         meta_writer.writerow(meta_header)  
   
         # Prepare jobs  
@@ -227,6 +332,7 @@ def main():
         handle.Close()  
   
     print(f"All transfers complete. Metadata written to {meta_file}")  
+    print(f"See {LOG_FILE} for details.")  
   
 if __name__ == '__main__':  
     main()  
