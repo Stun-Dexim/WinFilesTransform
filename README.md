@@ -1,22 +1,21 @@
 # WinFilesTransform
-  How to Use
-   
-  
-  Create or let the script create a config.ini with defaults.
-  Prepare your FileTransfers.csv with at least two columns: Origin Path, Target Path, plus any other metadata columns.
-  Run the script:
-  
-  python windows_file_transfer.py  
-  Follow prompts for CSV file path and (optionally) credentials.
-   
-  
-  Features Recap
-   
-  
-  INI file: Auto-creation, stores defaults, can be edited.
-  Windows Authentication: Prompts for credentials, uses current user if declined.
-  Multi-threading: Default 4 threads (configurable).
-  Timestamped Target Directory: Optional.
-  Filename Sanitization: Double extension and illegal char stripping (configurable).
-  Relative Path Handling: Uses base paths from INI.
-  Metadata File: CSV with hyperlinks, status, and illegal char info.
+How to Use
+ 
+
+	1. Install dependencies
+		a. pip install pywin32  
+ 
+	1. Place this script in a folder (e.g., windows_file_transfer.py).
+
+	1. Prepare your FileTransfers.csv
+		a. First two columns: Origin Path, Target Path
+		b. Additional columns will be preserved in metadata.
+		
+	2. Run the script
+		a. python windows_file_transfer.py  
+			i. It will prompt for the CSV file path and (if needed) credentials.
+			ii. If config.ini does not exist, it will offer to create one.
+			
+	3. Check output:
+		a. Transferred files will be in the specified target locations.
+Metadata CSV and a log file will be created in the same directory as your input CSV.![image](https://github.com/user-attachments/assets/761c334c-30ac-4a2d-b378-1300915714e9)
