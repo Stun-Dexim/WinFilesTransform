@@ -1,0 +1,32 @@
+I need a py script which behaves much the same as the script below with the exceptions noted below:
+	1. This script is for extracting files from salesforce. The new script should allow user to extract from a windows file system origin path to a target path.   User will specify origin and target via a csv file (lets call the csv file FileTransfers.csv for this conversation, but filename can vary depending on user specification.)
+	2. New script should have prompt for windows security authentication (like the SF script has for SF).... and should prompt the user if not specified in the ini file, but if the user declines to enter the credentials at runtime, the script should assume to use the users current windows credentials.
+	3. Features to carry forward:
+		a. Auto creation of ini at runtime if user confirms to create the ini.
+		b. multi-threading (with defaults suggested for windows)
+		c. Auto Timestamp for directory as an option
+		d. Double/dup file extension sanitization as an option
+		e. Illegal Char stripping as an option
+		f. use of ini file with many of the defaults carried into the new script as applicable.  
+			i. Add new arguments "Origin Path" and "Target Path".  These should be used as basepaths if filetransfers.csv paths are relative.
+		g. FileTransfers.csv file specification and use
+			i. File format for filetransfers.csv: Origin Path, Target Path, all other fields expected to be carried forward to metadata file in same ordinal position.
+			ii. Target path from ini file should be used as a base path if the FileTransfers.csv target path is recognized to be relative (otherwise if path in FileTransfers.csv is fixed, used the fixed).
+		h. metadata file creation 
+			i. Metadata argument should be according to the ordinal position of the fields in FileTransfers.csv but should also allow for "All" Argument.
+				1) "All": All fields from FileTranfers.csv should carry into metadata file.
+				2) "1,2,3": Fields 1, 2 and 3 should carry into metadata file.
+			ii. Then add these fields at end of metadata file: 
+				1) xls hyperlink to origin
+				2) xls hyperlink to new target
+				3) Transfer Status (success/failure w/ verbose error)
+				4) Illegal_Chars_Stripped
+	4. Features no longer applicable (from SF to this new windows script)
+		a. Filename pattern argument - this is not applicable 
+		b. output_dir argument replaced by Target path argument.
+		c. query argument - no longer applicable
+		d. AttachID_list_Incl_or_Excl
+		e. Attachments_list_CSV_filepath
+		 
+	
+	
